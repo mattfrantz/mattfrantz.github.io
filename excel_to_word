@@ -1,0 +1,191 @@
+from flask import Flask, request, render_template_string, send_file, jsonify
+import pandas as pd
+from docx import Document
+import os
+
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
+
+# Ensure folders exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# HTML Templates
+index_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Excel to Word Converter</title>
+</head>
+<body>
+    <h1>Upload Excel File to Convert to Word</h1>
+    <form action="/select_sheets" method="post" enctype="multipart/form-data">
+        <label for="file">Choose an Excel file:</label>
+        <input type="file" name="file" id="file" required>
+        <button type="submit">Upload</button>
+    </form>
+</body>
+</html>
+"""
+
+select_sheets_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Select Sheets</title>
+</head>
+<body>
+    <h1>Select Sheets to Process</h1>
+    <form action="/map_columns" method="post">
+        <input type="hidden" name="file_name" value="{{ file_name }}">
+        <label for="sheets">Select the Sheets:</label>
+        <select name="sheets" id="sheets" multiple required>
+            {% for sheet in sheets %}
+            <option value="{{ sheet }}">{{ sheet }}</option>
+            {% endfor %}
+        </select>
+        <br><br>
+        <button type="submit">Next</button>
+    </form>
+    <p><small>Hold CTRL or CMD to select multiple sheets.</small></p>
+</body>
+</html>
+"""
+
+map_columns_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Map Columns</title>
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.5/css/jquery.dataTables.min.css">
+</head>
+<body>
+    <h1>Map Columns for Each Sheet</h1>
+    <form action="/convert" method="post">
+        <input type="hidden" name="file_name" value="{{ file_name }}">
+        {% for sheet in sheets %}
+        <h2>Sheet: {{ sheet }}</h2>
+        <div id="table-{{ sheet }}"></div>
+        <label for="question_column_{{ sheet }}">Select the Question Column:</label>
+        <select name="question_column_{{ sheet }}" id="question_column_{{ sheet }}" required>
+            {% for column in columns[sheet] %}
+            <option value="{{ column }}">{{ column }}</option>
+            {% endfor %}
+        </select>
+        <br><br>
+        <label for="answer_columns_{{ sheet }}">Select the Answer Column(s):</label>
+        <select name="answer_columns_{{ sheet }}" id="answer_columns_{{ sheet }}" multiple required>
+            {% for column in columns[sheet] %}
+            <option value="{{ column }}">{{ column }}</option>
+            {% endfor %}
+        </select>
+        <hr>
+        {% endfor %}
+        <button type="submit">Convert</button>
+    </form>
+
+    <!-- DataTables and jQuery -->
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.5/js/jquery.dataTables.min.js"></script>
+    <script>
+        {% for sheet in sheets %}
+        $(document).ready(function() {
+            $("#table-{{ sheet }}").load("/preview_sheet/{{ sheet }}");
+        });
+        {% endfor %}
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(index_html)
+
+@app.route("/select_sheets", methods=["POST"])
+def select_sheets():
+    if "file" not in request.files:
+        return "No file part", 400
+    file = request.files["file"]
+    if file.filename == "":
+        return "No selected file", 400
+
+    # Save the uploaded file
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(filepath)
+
+    # Extract sheet names
+    try:
+        sheets = pd.ExcelFile(filepath).sheet_names
+    except Exception as e:
+        return f"Error reading Excel file: {e}", 400
+
+    # Pass sheet names to the selection page
+    return render_template_string(select_sheets_html, sheets=sheets, file_name=file.filename)
+
+@app.route("/map_columns", methods=["POST"])
+def map_columns():
+    file_name = request.form["file_name"]
+    sheets = request.form.getlist("sheets")
+
+    filepath = os.path.join(UPLOAD_FOLDER, file_name)
+
+    # Extract column names for each selected sheet
+    columns = {}
+    try:
+        for sheet in sheets:
+            df = pd.read_excel(filepath, sheet_name=sheet)
+            columns[sheet] = df.columns.tolist()
+    except Exception as e:
+        return f"Error reading Excel sheets: {e}", 400
+
+    # Pass column names and sheets to the column mapping page
+    return render_template_string(map_columns_html, sheets=sheets, columns=columns, file_name=file_name)
+
+@app.route("/preview_sheet/<sheet_name>")
+def preview_sheet(sheet_name):
+    file_name = request.args.get("file_name")
+    filepath = os.path.join(UPLOAD_FOLDER, file_name)
+    df = pd.read_excel(filepath, sheet_name=sheet_name)
+
+    # Return a DataTable HTML for the sheet
+    return df.to_html(classes="display")
+
+@app.route("/convert", methods=["POST"])
+def convert_file():
+    # Get file name and selected sheets from the form
+    file_name = request.form["file_name"]
+    filepath = os.path.join(UPLOAD_FOLDER, file_name)
+
+    # Create a Word document
+    doc = Document()
+
+    # Process each selected sheet
+    for key in request.form:
+        if key.startswith("question_column_"):
+            sheet_name = key.replace("question_column_", "")
+            question_column = request.form[key]
+            answer_columns = request.form.getlist(f"answer_columns_{sheet_name}")
+
+            # Read the selected sheet
+            df = pd.read_excel(filepath, sheet_name=sheet_name)
+
+            # Add content to the Word document
+            doc.add_heading(f"Sheet: {sheet_name}", level=1)
+            for _, row in df.iterrows():
+                question = str(row[question_column])
+                doc.add_paragraph(question, style="Heading 2")
+
+                answers = [str(row[col]) for col in answer_columns if not pd.isna(row[col])]
+                doc.add_paragraph("\n".join(answers))
+
+    # Save the Word document
+    output_filename = os.path.splitext(file_name)[0] + "_converted.docx"
+    output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+    doc.save(output_path)
+
+    return send_file(output_path, as_attachment=True)
+
+if __name__ == "__main__":
+    app.run(debug=True)
